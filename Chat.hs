@@ -1,4 +1,7 @@
-{-# LANGUAGE OverloadedStrings #-}
+{- Chat
+ - Functions for constructing and sending replies
+ - Queries established sqlite database
+ - and constructs random, markov chain messages -}
 
 module Chat where
 
@@ -16,10 +19,8 @@ import System.Random
 import Bot
 import Trainer
 
--- The maximum length of a message
-stopLength = 36
--- The mimimum length, after which NomeBot will end the message
--- at the next terminal punctuation mark it encounters
+-- The minimum and maximum length of a message
+maxLength = 46
 minLength = 5
 
 -- Write to the socket handle in standard IRC syntax
@@ -28,36 +29,19 @@ write s t = do
     h <- asks socket
     liftIO $ hPrintf h "%s %s\r\n" s t
 
--- Send a message to the channel
-sendMsg :: String -> Irc ()
-sendMsg t = do
-    cf <- asks config
-    let c = chan cf
-    write "PRIVMSG" (c ++ " :" ++ t)
+-- Reply only to messages sent on your channel from
+-- another user
+reply :: String -> String -> Irc ()
+reply n s 
+    | "PING" `isPrefixOf` s            = pong s
+    | ":irc" `isPrefixOf` s            = return ()
+    | (':' : n) `isPrefixOf` s         = return ()
+    | "BotQuit" `isPrefixOf` (clean s) = botQuit
+    | otherwise                        = sendRsp $ clean s
 
--- Upon receiving a message, reply. The bot's nick is
--- sent along with the message in order to ignore specific
--- server messages
-reply :: String -> Irc ()
-reply t = do
-    c <- asks config 
-    let n = nick c
-    getReply t n
-
--- Reply to server pings, ignore messages from yourself or from
--- the channel
-getReply :: String -> String -> Irc ()
-getReply t n  
-    | "PING" `isPrefixOf` t       = write "PONG" (':' : drop 6 t)
-    | ":irc" `isPrefixOf` t       = return ()
-    | (':' : n) `isPrefixOf` t    = return ()
-    | otherwise                   = respond t
-
--- Allows anyone to ask NomeBot to log out and terminate
-respond :: String -> Irc ()
-respond x 
-    | "BotQuit" `isPrefixOf` (clean x) = botQuit
-    | otherwise                        = getResponse $ clean x
+-- Respond to server pings
+pong :: String -> Irc ()
+pong s = write "PONG" $ ':' : drop 6 s
 
 botQuit :: Irc ()
 botQuit = do 
@@ -67,45 +51,59 @@ botQuit = do
 -- Scan for a valid key in the received message. If none,
 -- grab a random key from the table. Chain together a response
 -- from the starting key and then send it.
-getResponse :: String -> Irc ()
-getResponse s = do
+sendRsp :: String -> Irc ()
+sendRsp s = do
     k <- scanKey $ ( reverse . words . map toLower ) s
     startK <- randFrom k
     resp <- chainReply $ words startK
-    sendMsg $ makePretty resp
+    let msg = makePretty resp
+    c <- chan'
+    write "PRIVMSG" (c ++ " :" ++ msg)
 
--- TODO make compatible with variable length chains
--- Starting from the back of the received message, look for matching
--- keys in the table. If no key is found, get a random key 
-scanKey ws@(x:y:z:zs) = do
-    possKey <- getMarkovs $ unwords $ reverse $ take chainLength ws
-    case possKey of
-        [] -> scanKey (y:z:zs)
-        _  -> return $ map getKeys possKey
-scanKey _  = do
-    es <- randChain 
-    return $ [markovChain es]   
+
+scanKey ws
+    | length ws < chainLength = do es <- randRow; return $ [markovChain es]
+    | otherwise               = possKey ws
+
+possKey ws@(x:xs) = do
+    pk <- getRows $ (unwords . reverse . take chainLength) ws
+    case pk of
+        [] -> scanKey xs
+        _  -> return $ map getKeys pk
 
 -- Get a list of all entries in the Markov table with the same 'Chain'
 -- If none, will return an empty list
-getMarkovs ws = liftIO $ runSqlite "markovchains.sqlite" $ do
+getRows ws = liftIO $ runSqlite myDataBase $ do
    nxt <- selectList [MarkovChain ==. ws] [] 
    return nxt 
-
--- Extract a key (Chain) from an Entity Markov
-getKeys = markovChain . entityVal
--- Extract a value (NextWord) from an Entity Markov
-getVals = markovNextWord . entityVal
 
 -- Get the number of rows in the table, and get a random
 -- number in that range to use as key (ID) for selecting
 -- a random row (Entity Markov)
-randChain = liftIO $ runSqlite "markovchains.sqlite" $ do
+randRow = liftIO $ runSqlite myDataBase $ do
     c <- count [MarkovChain !=. " "]
     idx <- liftIO $ getRandIndex $ c - 1
     a <- get $ wrapKey idx
     let b = fromJust a
     return b
+
+-- Select a random element of a list 
+randFrom ws = liftIO $ do
+    let upperB = (length ws) - 1
+    idx <- getRandIndex upperB
+    return $ ws !! idx
+
+-- Generate a random number between 0 and an upper bound
+getRandIndex :: Int -> IO Int
+getRandIndex bound = do
+    gen <- newStdGen 
+    let (randNumber, newGen) = randomR (0,bound) gen :: (Int, StdGen)
+    return randNumber
+
+-- Extract a key (Chain) from an Entity Markov
+getKeys = markovChain . entityVal
+-- Extract a value (NextWord) from an Entity Markov
+getVals = markovNextWord . entityVal
 
 -- A little dangerous to be ignoring Nothing, but the value
 -- used should be a valid ID and the program should probably
@@ -117,24 +115,10 @@ fromJust (Just a) = a
 wrapKey :: Int -> Key Markov
 wrapKey a = MarkovKey $ fromIntegral a
 
--- Select a random element of a list 
-randFrom ws = liftIO $ do
-    let upperB = (length ws) - 1
-    idx <- getRandIndex upperB
-    return $ ws !! idx
-
--- Generate a random number between 0 and an upper bound
-getRandIndex :: Int -> IO Int
-getRandIndex bound = do
-    gen <- getStdGen 
-    let (randNumber, newGen) = randomR (0,bound) gen :: (Int, StdGen)
-    gen' <- newStdGen
-    return randNumber
-
 -- Chain new words to the reply until it exceeds the stop length
 chainReply ws
-    | length ws >= stopLength = return ws
-    | otherwise               = do addw <- chainWord ws; chainReply' ws addw
+    | length ws >= maxLength = return ws
+    | otherwise              = chainWord ws >>= chainReply' ws
 
 -- If the new word is the stop character or ends in terminal punctuation
 -- and the reply is greater than the min length, stop, otherwise continue
@@ -149,14 +133,14 @@ chainReply' ws w
 -- as a key for finding the next word
 chainWord ws = do
     let key = takeLast chainLength ws
-    nexts <- getMarkovs $ unwords key
+    nexts <- getRows $ unwords key
     chainWord' ws nexts
 
 -- If the words are not a key, get a new random word from the table
 -- Otherwise, randomly select one of the possible nextWords from the
 -- given key
 chainWord' ws [] = do 
-    new <- randChain
+    new <- randRow
     return $ markovNextWord new
 chainWord' ws nexts = do
     next <- randFrom $ map getVals nexts   
@@ -185,6 +169,7 @@ capitalizeFirst (x:xs) = capitalizeFirst' $ (toUpper x) : xs
 capitalizeFirst' [] = []
 capitalizeFirst' (x:y:z:zs)
     | (x `elem` puncs) && (y == ' ') = x : y : (toUpper z) : (capitalizeFirst' zs)
+    | (x == ' ') && (y == 'i') && (z == ' ') = x : 'I' : z : (capitalizeFirst' zs)
     | otherwise                      = x : (capitalizeFirst' (y:z:zs))
 capitalizeFirst' xs                  = xs
 

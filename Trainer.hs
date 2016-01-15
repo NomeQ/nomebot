@@ -1,3 +1,9 @@
+{- Trainer
+ - Creates a database and table of markov chains from
+ - a given text. Can be run by using NomeBot with -t command
+ - line option. Recommended usage: cat sometxt.txt | ./NomeBot -t
+ -}
+
 {-# LANGUAGE QuasiQuotes, TemplateHaskell, TypeFamilies #-}
 {-# LANGUAGE OverloadedStrings, GADTs, FlexibleContexts #-}
 {-# LANGUAGE MultiParamTypeClasses, GeneralizedNewtypeDeriving #-}
@@ -12,6 +18,8 @@ import Database.Persist.TH
 import Control.Monad
 import Control.Monad.IO.Class
 
+import Bot
+
 share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persistLowerCase|
 Markov
   chain String
@@ -20,38 +28,38 @@ Markov
 |]
 
 chainLength = 2
+myDataBase = "markovchains.sqlite"
 
-trainBot :: IO ()
-trainBot = do
+trainBot :: BotConfig -> IO ()
+trainBot conf = do
     contents <- getContents
-    let allWords = words $ map toLower $ asciiOnly contents
-    runSqlite "markovchains.sqlite" $ do
-        runMigration migrateAll
+    let allWords = words $ map toLower $ goodChars contents
+    runSqlite myDataBase $ do
         putChains allWords
         return ()
 
--- Using chains of length 2, only add if at least 3 elements of list
-putChains ws@(w:x:ys) = do
-    putChain ws
-    putChains (x:ys)
-putChains _ = return ()
+putChains [] = return ()
+putChains ws@(x:xs)
+    | length ws >= chainLength = putChain ws >> putChains xs 
+    | otherwise                = return ()
 
--- We're assured when this is called that the list has at least 3 
--- elements, but we don't know if it has a fourth. Make sure list
--- indexing does not fail.
+
 putChain ws = insert $ Markov key value
     where
         key = (unwords . take chainLength) ws
         value = val' ws  
 
--- If there are four or more elements, insert the next word for val,
--- otherwise enter the stop symbol.
-val' (x:y:z:_) = z
-val' _ = "#"
+val' ws 
+    | length ws > chainLength = ( head . drop chainLength) ws
+    | otherwise               = "#"
 
--- Remove characters incompatible with IRC
-asciiOnly :: String -> String
-asciiOnly [] = []
-asciiOnly (x:xs)
-    | isAscii x = x : (asciiOnly xs)
-    | otherwise = asciiOnly xs
+goodChars :: [Char] -> [Char]
+goodChars = repCtl . filter (isLatin1) . filter (/= '(') . filter (/= ')')
+
+repCtl [] = []
+repCtl (x:xs)
+    | isControl x  = ' ' : (repCtl xs)
+    | otherwise    = x : (repCtl xs) 
+
+notBad :: Char -> Bool
+notBad c = (isLatin1 c) && ((not . isControl) c) && ((/= '(') c) && ((/= ')') c)

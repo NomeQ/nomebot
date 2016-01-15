@@ -1,82 +1,93 @@
-{-# LANGUAGE OverloadedStrings #-}
-
-{- This file is the Main program file for NomeBot, an IRC Chatbot
- - trained using Markov Chains to respond to IRC messages with
- - responses based on the corpus of yours truly.
+{- NomeBot, An Irc Chatbot
  -
  - Author: Naomi Dickerson
- - E-mail: nld2@pdx.edu
+ - Email : nld2@pdx.edu
+ -
+ - Final Project for CS 557
  -}
 
 module Main where
 
 import System.IO
-import Text.Printf
-import Data.List
-import System.Exit
 import System.Environment
+import System.Console.GetOpt
+import System.Random
+import Database.Persist.Sqlite
 import Control.Monad
 import Control.Monad.Reader
 import Network
-import Database.Persist.Sqlite
-import Database.Persist.TH
-import System.Random
 
 import Bot
-import Chat
 import Trainer
+import Chat
 
--- The bot can be run in standard chat mode where it will log in to
--- an IRC server, join a specified channel, and listen for and reply
--- to messages indefinitely, or it can be run with the command line
--- flag "-t" to put it in training mode.
-main = do
-    runSqlite "markovchains.sqlite" $ do
-        runMigration migrateAll 
-    args <- getArgs
-    dispatch args
+-- A default configuration which sets up a bot on a local server
+-- To change, specify command line options
+defaultConfig :: BotConfig
+defaultConfig = BotConfig { training = False, server = "localhost"
+                , port = 6667, nick = "NomeBot", chan = "#NomeBotChan"
+                , db = "markovchains.sqlite" }
 
-dispatch :: [String] -> IO ()
-dispatch ["-t"] = trainBot
-dispatch _      = do
-    conf <- configure
-    bot  <- connect conf
-    runReaderT run bot 
+-- Print above usage instructions
+header = "Usage: ./Nomebot [Options...]"
 
--- A bot can be configured with preset values. Eventually, these should
--- be moved to a configuration file or they should be able to be specified
--- on the command line
-configure :: IO BotConfig 
-configure = return $ BotConfig { server = "localhost", port = 6667
-                               , nick = "NomeBot", chan = "#NomeBotChan" }
+-- Command line options return list of functions on BotConfig
+-- Note that specifying database does not currently work
+options :: [OptDescr (BotConfig -> BotConfig)]
+options = [ Option ['t'] ["train"] (NoArg 
+              (\opt -> opt { training = True })) "Put bot in training mode"
+          , Option ['s'] ["server"] (ReqArg 
+              (\arg opt -> opt { server = arg }) "SERVER") "Specify server"
+          , Option ['p'] ["port"] (ReqArg 
+              (\arg opt -> opt { port = (read arg) }) "NUMBER") "Specify port"
+          , Option ['n'] ["nick"] (ReqArg 
+              (\arg opt -> opt { nick = arg }) "NICK") "Specify nick" 
+          , Option ['c'] ["chan"] (ReqArg 
+              (\arg opt -> opt { chan = arg }) "#CHANNEL") "Specify channel"
+          , Option ['d'] ["database"] (ReqArg 
+              (\arg opt -> opt { db = arg }) "FILE") "Specify database" ]
 
--- Creates a Bot with a socket connected to the given server and port,
--- and the configuration settings
-connect :: BotConfig -> IO Bot
-connect c = do
-    sock <- connectTo (server c) $ PortNumber $ fromIntegral (port c)
-    hSetBuffering sock NoBuffering
-    return $ Bot sock c
 
--- Gets the config of the Bot and provides nick and user to the IRC
--- server and requests to join the specfied channel. Then listens on
--- the Bot's socket
+-- Create config from default config and command line options
+configure fs = foldl overwrite defaultConfig fs  
+
+-- e.g. update defaultConfig (\a opt -> opt { server = a } )
+-- Reverses order so lambda in options can be used
+overwrite c f = f c
+
+-- Put bot in training mode, or run it on the IRC server depending on 
+-- given configuration. Load the tables for markov chain key:value
+dispatch :: BotConfig -> IO ()
+dispatch conf = do
+    runSqlite myDataBase $ do
+        runMigration migrateAll
+    if (training conf) then trainBot conf else do
+       sock <- connectTo (server conf) $ PortNumber $ fromIntegral (port conf)
+       hSetBuffering sock NoBuffering
+       runReaderT run $ Bot sock conf
+        
+-- Connect to the Irc server and listen/reply forever until a
+-- 'BotQuit' command is received
 run :: Irc ()
 run = do
-    cf <- asks config
-    let n = nick cf
-        c = chan cf
+    n <- nick'
+    c <- chan'
     write "NICK" n
-    write "USER" (n++" 0 * :Nome Bot")
+    write "USER" $ n++" 0 * :NomeBot"    
     write "JOIN" c
-    asks socket >>= listen
-
--- Indefinitely check for incoming messages, print them to console,
--- and reply
-listen :: Handle -> Irc ()
-listen h = forever $ do
     h <- asks socket
-    s <- liftIO $ hGetLine h
-    liftIO $ putStrLn s
-    reply s
+    forever $ do
+        s <- liftIO $ hGetLine h
+        liftIO $ putStrLn s
+        reply n s    
 
+-- Get command line args and either error if incorrect, or run program
+main = do
+    args <- getArgs
+    gen <- getStdGen
+    case getOpt RequireOrder options args of
+        (flags, [], [])  -> dispatch $ configure flags
+        (_, badArgs, []) -> error $ "bad arguments: " ++ unwords badArgs
+        (_, _, badFlags) -> error $ concat badFlags ++ usageInfo header options
+
+    
